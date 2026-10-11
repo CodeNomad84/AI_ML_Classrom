@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data and model artefacts
+data/raw/
+*.h5
+*.pkl
+models/
+*.pt
+
+# OS
+.DS_Store
+
+# Instructor-only material (solutions, hidden tests): never push publicly
+instructor/
+in_class_problems/*_solutions.ipynb
