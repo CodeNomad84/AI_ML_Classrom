@@ -33,7 +33,27 @@ from typing import ClassVar, Final, TypeVar
 import numpy as np
 import pandas as pd
 
-from aerospace_ai.pipeline import DataPipeline
+from aerospace_ai.pipeline import DataPipeline, DropNonFinite, FillGaps, HampelFilter
+from aerospace_ai.preprocessing import (
+    ForecastTarget,
+    MarkInvalid,
+    PerGroup,
+    SortAndDeduplicate,
+)
+from aerospace_ai.rover import (
+    ACCEL_COLUMN,
+    GYRO_COLUMN,
+    LIDAR_MAX_RANGE_M,
+    LIDAR_MIN_RANGE_M,
+    LIDAR_NO_RETURN,
+    RANGE_COLUMN,
+    RUN_COLUMN,
+    SAMPLE_PERIOD_S,
+    SPEED_COLUMN,
+    TIME_COLUMN,
+    RoverLogConfig,
+    RoverLogGenerator,
+)
 from aerospace_ai.sensors import (
     ISA_EXPONENT,
     ISA_LAPSE_RATE_K_PER_M,
@@ -54,6 +74,16 @@ FUEL_FEATURES: Final[tuple[str, ...]] = (
 )
 FUEL_TARGET: Final[str] = "fuel_flow_gph"
 
+ROVER_FEATURES: Final[tuple[str, ...]] = (
+    RANGE_COLUMN,
+    SPEED_COLUMN,
+    ACCEL_COLUMN,
+    GYRO_COLUMN,
+)
+ROVER_TARGET: Final[str] = "range_ahead_m"
+DEFAULT_HORIZON_S: Final[float] = 1.0
+MAX_INTERPOLATED_GAP: Final[int] = 5
+
 LoaderT = TypeVar("LoaderT", bound="type[DatasetLoader]")
 
 
@@ -73,6 +103,8 @@ class Dataset:
         target_name: Name of the target quantity (with units).
         name: Short identifier of the data source.
         metadata: Free-form information about how the data was made.
+        groups: Optional group label per row (e.g. the test-drive number),
+            used by group-aware splitters (Week 5).
     """
 
     X: np.ndarray
@@ -81,6 +113,7 @@ class Dataset:
     target_name: str
     name: str = "dataset"
     metadata: dict[str, object] = field(default_factory=dict, compare=False)
+    groups: np.ndarray | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         """Check that shapes and names agree.
@@ -101,6 +134,11 @@ class Dataset:
             raise ValueError(
                 f"{len(self.feature_names)} feature names for {X.shape[1]} columns"
             )
+        if self.groups is not None:
+            groups = np.asarray(self.groups)
+            if groups.shape != y.shape:
+                raise ValueError(f"{groups.shape[0]} group labels for {len(y)} rows")
+            object.__setattr__(self, "groups", groups)
         # The dataclass is frozen, so bypass __setattr__ to store float copies.
         object.__setattr__(self, "X", X)
         object.__setattr__(self, "y", y)
@@ -145,6 +183,7 @@ class Dataset:
             self.target_name,
             f"{self.name}/{suffix}",
             dict(self.metadata),
+            None if self.groups is None else self.groups[rows],
         )
 
     def split(
@@ -155,7 +194,8 @@ class Dataset:
     ) -> tuple[Dataset, Dataset]:
         """Split into a training and a test set.
 
-        The default is a *chronological* split (first part train, last part
+        For grouped data (several test drives) use the Week 5 splitters in
+        :mod:`aerospace_ai.splits` instead. The default is a *chronological* split (first part train, last part
         test). For time-ordered sensor data this is the leak-free choice: a
         random split would let the model see the future of every test point.
 
@@ -544,3 +584,118 @@ class FlightLogCsvLoader(CsvTableLoader):
         frame = log.data.copy()
         frame[self.DERIVED_LOAD_FACTOR] = log.load_factor()
         return frame
+
+
+def rover_cleaning_pipeline(
+    horizon_steps: int = round(DEFAULT_HORIZON_S / SAMPLE_PERIOD_S),
+) -> DataPipeline[pd.DataFrame, pd.DataFrame]:
+    """Return the Week 5 lecture recipe for the raw rover log (stateless only).
+
+    1. Sort by (run, time) and drop re-sent rows.
+    2. LiDAR 0.0 ("no return") and impossible ranges become NaN.
+    3. Per run: Hampel filter on range (dust echoes) and acceleration (spikes).
+    4. Per run: interpolate gaps of up to 5 samples in range and wheel speed.
+    5. Per run: the target is the range ``horizon_steps`` samples later.
+    6. Drop rows whose features or target are still missing (the wall beyond
+       the LiDAR's reach: the model is only valid inside the sensor range).
+
+    Nothing here learns from data, so it may run before the train/test split.
+    Imputers and scalers come *after* the split (see the Week 5 lab).
+    """
+    return DataPipeline(
+        [
+            SortAndDeduplicate((RUN_COLUMN, TIME_COLUMN)),
+            MarkInvalid(
+                (RANGE_COLUMN,),
+                sentinels=(LIDAR_NO_RETURN,),
+                valid_min=LIDAR_MIN_RANGE_M,
+                valid_max=LIDAR_MAX_RANGE_M,
+            ),
+            PerGroup(HampelFilter((RANGE_COLUMN, ACCEL_COLUMN)), RUN_COLUMN),
+            PerGroup(
+                FillGaps(
+                    (RANGE_COLUMN, SPEED_COLUMN), MAX_INTERPOLATED_GAP, TIME_COLUMN
+                ),
+                RUN_COLUMN,
+            ),
+            PerGroup(
+                ForecastTarget(RANGE_COLUMN, horizon_steps, ROVER_TARGET), RUN_COLUMN
+            ),
+            DropNonFinite((RANGE_COLUMN, SPEED_COLUMN, ACCEL_COLUMN, ROVER_TARGET)),
+        ]
+    )
+
+
+@DatasetFactory.register("rover_range_forecast")
+class RoverRangeForecastLoader(DatasetLoader):
+    """Week 5: forecast the LiDAR range to the wall one second ahead.
+
+    Reads a raw rover log from ``path`` or generates one with
+    :class:`~aerospace_ai.rover.RoverLogGenerator`, runs a *stateless*
+    cleaning pipeline (default :func:`rover_cleaning_pipeline`) and returns a
+    :class:`Dataset` whose ``groups`` are the run ids, ready for a
+    group-aware split. Rows whose gyroscope value is missing are kept (that
+    feature may be NaN): impute it after the split.
+    """
+
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        n_runs: int = 16,
+        seed: int = 5,
+        horizon_s: float = DEFAULT_HORIZON_S,
+        cleaning: DataPipeline[pd.DataFrame, pd.DataFrame] | None = None,
+    ) -> None:
+        """Configure the source and the recipe.
+
+        Args:
+            path: Raw CSV with the columns of :data:`aerospace_ai.rover.ROVER_COLUMNS`;
+                None generates a log instead.
+            n_runs: Runs to generate (ignored when ``path`` is given).
+            seed: Generator seed (ignored when ``path`` is given).
+            horizon_s: Forecast horizon in seconds.
+            cleaning: Stateless pipeline that must create the target column;
+                the lecture recipe if None.
+
+        Raises:
+            ValueError: If the horizon is not a positive multiple of 0.1 s.
+        """
+        steps = round(horizon_s / SAMPLE_PERIOD_S)
+        if steps < 1 or not np.isclose(steps * SAMPLE_PERIOD_S, horizon_s):
+            raise ValueError("horizon_s must be a positive multiple of 0.1 s")
+        self.path = None if path is None else Path(path)
+        self.config = RoverLogConfig(n_runs=n_runs, seed=seed)
+        self.horizon_steps = steps
+        self.cleaning = cleaning or rover_cleaning_pipeline(steps)
+
+    def raw_frame(self) -> pd.DataFrame:
+        """Return the raw log (read or generated), before any cleaning."""
+        if self.path is not None:
+            return pd.read_csv(self.path)
+        return RoverLogGenerator(self.config).generate()
+
+    def load(self) -> Dataset:
+        """Clean the raw log and return features, target and run ids.
+
+        Raises:
+            KeyError: If the cleaned table lacks a feature or the target.
+        """
+        raw = self.raw_frame()
+        clean = self.cleaning.fit_transform(raw)
+        missing = [c for c in (*ROVER_FEATURES, ROVER_TARGET) if c not in clean]
+        if missing:
+            raise KeyError(f"cleaned table lacks {missing}")
+        return Dataset(
+            clean[list(ROVER_FEATURES)].to_numpy(),
+            clean[ROVER_TARGET].to_numpy(),
+            ROVER_FEATURES,
+            ROVER_TARGET,
+            self.registry_name,
+            {
+                "source": str(self.path) if self.path else repr(self.config),
+                "raw_rows": len(raw),
+                "rows_dropped": len(raw) - len(clean),
+                "cleaning": str(self.cleaning),
+            },
+            clean[RUN_COLUMN].to_numpy(),
+        )
